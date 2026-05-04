@@ -1,0 +1,152 @@
+name: Deploy Bedrock Sage Debian13
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy to Debian 13 Server via SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VM_PUBLIC_IP }}
+          username: ${{ secrets.VM_USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.VM_PORT }}
+          command_timeout: 30m
+          script: |
+            set -euo pipefail
+            umask 0002
+
+            # ── Переменные из secrets ──────────────────────────────────────────
+            PROJECT_NAME="${{ secrets.PROJECT_NAME }}"
+            REPO_URL="${{ secrets.REPO_URL }}"
+            BRANCH="${{ secrets.DEPLOY_BRANCH }}"
+            THEME_DIR="${{ secrets.THEME_DIR }}"
+            PHP_VERSION="${{ secrets.PHP_VERSION }}"
+
+            # ── Валидация секретов (защита от инъекций) ────────────────────────
+            [[ "${PROJECT_NAME}" =~ ^[a-z0-9_-]+$ ]] || { echo "ERROR: Invalid PROJECT_NAME"; exit 1; }
+            [[ "${BRANCH}" =~ ^[a-zA-Z0-9/_.-]+$ ]]  || { echo "ERROR: Invalid DEPLOY_BRANCH"; exit 1; }
+            [[ "${PHP_VERSION}" =~ ^[0-9]+\.[0-9]+$ ]] || { echo "ERROR: Invalid PHP_VERSION"; exit 1; }
+
+            # ── Пути ──────────────────────────────────────────────────────────
+            APP_DIR="/var/www/${PROJECT_NAME}"
+            RELEASES_DIR="${APP_DIR}/releases"
+            SHARED_DIR="${APP_DIR}/shared"
+            CURRENT_DIR="${APP_DIR}/current"
+            THEME_CACHE="${SHARED_DIR}/node_modules_cache"
+
+            RELEASE_ID=$(date +%Y%m%d%H%M%S)
+            RELEASE_DIR="${RELEASES_DIR}/${RELEASE_ID}"
+
+            # Сохраняем предыдущий релиз для отката
+            PREVIOUS_RELEASE="$(readlink -f "${CURRENT_DIR}" 2>/dev/null || echo "")"
+            DEPLOY_USER="${{ secrets.VM_USERNAME }}"
+            _SWITCHED=0
+
+            # ── Rollback trap ──────────────────────────────────────────────────
+            _rollback() {
+              echo "==> ERROR: откат на предыдущий релиз"
+              if [[ "${_SWITCHED}" -eq 1 && -n "${PREVIOUS_RELEASE}" && -d "${PREVIOUS_RELEASE}" ]]; then
+                ln -sfn "${PREVIOUS_RELEASE}" "${CURRENT_DIR}"
+                sudo /bin/systemctl reload "php${PHP_VERSION}-fpm" || true
+                sudo /bin/systemctl reload nginx || true
+                echo "==> Откат выполнен: ${PREVIOUS_RELEASE}"
+              else
+                echo "==> Переключение ещё не было — чистим незаконченный релиз"
+              fi
+              [[ -d "${RELEASE_DIR}" ]] && rm -rf "${RELEASE_DIR}" || true
+            }
+            trap '_rollback' ERR
+
+            # ── Clone ─────────────────────────────────────────────────────────
+            echo "==> Clone release"
+            git clone --branch "${BRANCH}" --depth 1 "${REPO_URL}" "${RELEASE_DIR}"
+
+            # ── Shared links ──────────────────────────────────────────────────
+            echo "==> Shared links"
+            ln -sfn "${SHARED_DIR}/.env" "${RELEASE_DIR}/.env"
+
+            rm -rf "${RELEASE_DIR}/web/app/uploads"
+            ln -sfn "${SHARED_DIR}/web/app/uploads" "${RELEASE_DIR}/web/app/uploads"
+
+            rm -rf "${RELEASE_DIR}/web/app/cache"
+            ln -sfn "${SHARED_DIR}/web/app/cache" "${RELEASE_DIR}/web/app/cache"
+
+            # ── Composer Bedrock ──────────────────────────────────────────────
+            echo "==> Composer Bedrock"
+            cd "${RELEASE_DIR}"
+            composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction
+
+            # ── Theme build ───────────────────────────────────────────────────
+            echo "==> Theme dependencies and build"
+            if [ -d "${RELEASE_DIR}/${THEME_DIR}" ]; then
+              cd "${RELEASE_DIR}/${THEME_DIR}"
+
+              if [ -f composer.json ]; then
+                composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction
+              fi
+
+              # Кэш node_modules между релизами для ускорения деплоя
+              if [[ -d "${THEME_CACHE}" ]]; then
+                echo "==> Restoring node_modules from cache"
+                cp -r "${THEME_CACHE}" node_modules
+              fi
+
+              npm ci
+              npm run build
+
+              echo "==> Updating node_modules cache"
+              rm -rf "${THEME_CACHE}"
+              cp -r node_modules "${THEME_CACHE}"
+            fi
+
+            # ── Fix permissions ───────────────────────────────────────────────
+            echo "==> Fix permissions"
+            chgrp -R www-data "${RELEASE_DIR}"
+            find "${RELEASE_DIR}" -type d -exec chmod 2775 {} \;
+            find "${RELEASE_DIR}" -type f -exec chmod 664 {} \;
+            setfacl -R -m "u:${DEPLOY_USER}:rwx" "${RELEASE_DIR}"
+            setfacl -R -m "g:www-data:rwx" "${RELEASE_DIR}"
+            setfacl -R -d -m "u:${DEPLOY_USER}:rwx" "${RELEASE_DIR}"
+            setfacl -R -d -m "g:www-data:rwx" "${RELEASE_DIR}"
+
+            # ── Switch current ────────────────────────────────────────────────
+            echo "==> Switch current"
+            ln -sfn "${RELEASE_DIR}" "${CURRENT_DIR}"
+            _SWITCHED=1
+
+            # ── Reload services ───────────────────────────────────────────────
+            echo "==> Reload services"
+            sudo /bin/systemctl reload "php${PHP_VERSION}-fpm"
+            sudo /bin/systemctl reload nginx
+
+            # ── WP cache & DB migrations ──────────────────────────────────────
+            echo "==> WP: clear caches"
+            WP="wp --path=${CURRENT_DIR}/web/wp --allow-root"
+            $WP acorn optimize:clear || true
+            $WP cache flush || true
+
+            echo "==> WP: DB migrations"
+            $WP core update-db || true
+
+            # ── Health check ──────────────────────────────────────────────────
+            echo "==> Health check"
+            DOMAIN_CHECK="$(grep WP_HOME "${SHARED_DIR}/.env" | cut -d"'" -f2)"
+            if [[ -n "${DOMAIN_CHECK}" ]]; then
+              HTTP_CODE="$(curl -sk -o /dev/null -w "%{http_code}" "${DOMAIN_CHECK}/" || echo "000")"
+              if [[ "${HTTP_CODE}" != "200" && "${HTTP_CODE}" != "301" && "${HTTP_CODE}" != "302" ]]; then
+                echo "WARN: site returned HTTP ${HTTP_CODE} — проверь сайт вручную"
+              else
+                echo "Health check OK: HTTP ${HTTP_CODE}"
+              fi
+            fi
+
+            # ── Cleanup old releases ──────────────────────────────────────────
+            echo "==> Cleanup old releases"
+            find "${RELEASES_DIR}" -mindepth 1 -maxdepth 1 -type d | sort | head -n -5 | xargs -r rm -rf
