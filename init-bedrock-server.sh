@@ -222,16 +222,45 @@ echo -e "${GREEN}SSH public key добавлен для пользователе
 echo ""
 
 echo "==> SSH hardening"
-cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%F-%H%M%S)
+cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%F-%H%M%S)"
 
-sed -i \
-  -e "s/^#\?Port .*/Port ${SSH_PORT}/" \
-  -e "s/^#\?PermitRootLogin .*/PermitRootLogin no/" \
-  -e "s/^#\?PasswordAuthentication .*/PasswordAuthentication no/" \
-  -e "s/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/" \
-  /etc/ssh/sshd_config
+# Drop-in читается раньше 50-cloud-init.conf, а в sshd побеждает
+# ПЕРВОЕ найденное значение директивы.
+cat > /etc/ssh/sshd_config.d/00-hardening.conf <<EOF
+Port ${SSH_PORT}
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+MaxAuthTries 3
+LoginGraceTime 20
+AllowUsers ${DEPLOY_USER} ${ADMIN_USER}
+EOF
+chmod 644 /etc/ssh/sshd_config.d/00-hardening.conf
+
+# Убираем Port из основного конфига, чтобы не было дублей
+sed -i 's/^Port .*/#&/' /etc/ssh/sshd_config
+
+# Добиваем PasswordAuthentication yes в чужих drop-in файлах (cloud-init и т.п.)
+for f in /etc/ssh/sshd_config.d/*.conf; do
+  [[ "$f" == "/etc/ssh/sshd_config.d/00-hardening.conf" ]] && continue
+  sed -i 's/^\s*PasswordAuthentication\s\+yes/PasswordAuthentication no/I' "$f"
+done
+
+# Не даём cloud-init пересоздать настройку
+if [[ -d /etc/cloud/cloud.cfg.d ]]; then
+  echo "ssh_pwauth: false" > /etc/cloud/cloud.cfg.d/99-disable-pwauth.cfg
+fi
 
 sshd -t
+
+# Проверяем реально применённые значения до рестарта
+EFFECTIVE="$(sshd -T)"
+echo "$EFFECTIVE" | grep -qi '^passwordauthentication no$'       || { echo -e "${RED}ERROR: PasswordAuthentication не отключён${NC}"; exit 1; }
+echo "$EFFECTIVE" | grep -qi '^kbdinteractiveauthentication no$' || { echo -e "${RED}ERROR: KbdInteractiveAuthentication не отключён${NC}"; exit 1; }
+echo "$EFFECTIVE" | grep -qi '^permitrootlogin no$'              || { echo -e "${RED}ERROR: PermitRootLogin не отключён${NC}"; exit 1; }
+echo "$EFFECTIVE" | grep -qi "^port ${SSH_PORT}$"                || { echo -e "${RED}ERROR: порт ${SSH_PORT} не применился${NC}"; exit 1; }
+
 systemctl restart ssh || systemctl restart sshd
 
 echo ""
@@ -294,12 +323,23 @@ ufw --force enable
 
 echo "==> Fail2ban"
 cat > /etc/fail2ban/jail.local <<EOF
+[DEFAULT]
+# Свой постоянный IP добавьте сюда, чтобы случайно не забанить себя:
+# ignoreip = 127.0.0.1/8 ::1 87.244.58.222
+ignoreip = 127.0.0.1/8 ::1
+
 [sshd]
-enabled = true
-port = ${SSH_PORT}
-maxretry = 5
-findtime = 10m
-bantime = 1h
+enabled  = true
+port     = ${SSH_PORT}
+backend  = systemd
+mode     = aggressive
+maxretry = 3
+findtime = 1d
+bantime  = 7d
+
+[recidive]
+enabled  = true
+bantime  = 30d
 EOF
 
 systemctl enable fail2ban
