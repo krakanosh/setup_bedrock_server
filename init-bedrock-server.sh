@@ -1016,7 +1016,7 @@ chmod +x "/usr/local/bin/${NAME}-deploy-template"
 
 echo "==> Ограниченный sudo для reload сервисов"
 cat > "/etc/sudoers.d/${DEPLOY_USER}-${NAME}" <<EOF
-${DEPLOY_USER} ALL=NOPASSWD: /bin/systemctl reload php${PHP_VERSION}-fpm
+${DEPLOY_USER} ALL=NOPASSWD: /bin/systemctl restart php${PHP_VERSION}-fpm
 ${DEPLOY_USER} ALL=NOPASSWD: /bin/systemctl reload nginx
 EOF
 
